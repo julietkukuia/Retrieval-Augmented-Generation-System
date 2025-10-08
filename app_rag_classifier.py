@@ -1,5 +1,9 @@
 # app_rag_classifier.py
 # Ticket RAG + Urgency Classifier (streamlit-safe + sklearn training + bundle upload)
+# - Supports uploading a trained .joblib/.pkl bundle
+# - Trains text-only or ColumnTransformer (text + cats + nums) models in-app
+# - Hardened against sklearn 1.7+ "mixed selector" & feature-name errors
+# - Graceful warnings for sklearn version mismatch
 
 import os
 import io
@@ -80,34 +84,93 @@ def extractive_summary(query: str, docs: list[str], max_sentences: int = 3) -> s
         chosen_idx.append(best_i)
     return " ".join([sentences[i] for i in chosen_idx])
 
+# ---------- ColumnTransformer safety helpers ----------
+
+def has_mixed_selectors(column_transformer) -> bool:
+    """True if ColumnTransformer selectors mix ints and strs (breaks on sklearn >=1.7)."""
+    if not hasattr(column_transformer, "transformers_"):
+        return False
+    has_int, has_str = False, False
+    for _, _, cols in column_transformer.transformers_:
+        if cols is None or cols == "drop":
+            continue
+        if isinstance(cols, (list, tuple, np.ndarray)):
+            for c in cols:
+                if isinstance(c, (int, np.integer)):
+                    has_int = True
+                elif isinstance(c, str):
+                    has_str = True
+        elif isinstance(cols, (int, np.integer)):
+            has_int = True
+        elif isinstance(cols, str):
+            has_str = True
+    return has_int and has_str
+
 # ---------- Prediction helper (works for text-only or ColumnTransformer pipelines) ----------
 
 def _proba1_from_matrix(m: np.ndarray) -> float:
     return float(m[0, 1])
 
 def predict_proba_safe(model, text: str) -> float:
-    # text-only pipelines usually accept list[str]
+    """
+    Robust prediction for:
+      - text-only Pipeline([('tfidf', ...), ('clf', ...)])
+      - ColumnTransformer Pipeline([('feats', ColumnTransformer), ('clf', ...)])
+    Falls back with a clear message if a mixed-selector ColumnTransformer is detected.
+    """
+    # Try text-only path first
     if hasattr(model, "predict_proba"):
         try:
             return _proba1_from_matrix(model.predict_proba([text]))
         except Exception:
             pass
-    # ColumnTransformer pipelines expect a DataFrame with required columns
+
+    # ColumnTransformer path
     if hasattr(model, "named_steps") and "feats" in model.named_steps:
         feats = model.named_steps["feats"]
-        expected_cols = set()
-        for name, trans, cols in feats.transformers_:
+
+        # Detect the mixed selectors case proactively
+        try:
+            if has_mixed_selectors(feats):
+                st.error(
+                    "Prediction blocked: the loaded model's ColumnTransformer mixes **integer** and "
+                    "**string** selectors. This is incompatible with scikit-learn ≥1.7 feature-name checks. "
+                    "Please retrain in the app (recommended) or upload a text-only model bundle."
+                )
+                return 0.5  # neutral probability so UI doesn't crash
+        except Exception:
+            # if inspection fails, proceed and try anyway
+            pass
+
+        # Build a one-row DataFrame with expected columns; coerce all column names to str
+        expected_cols = []
+        for _, _, cols in feats.transformers_:
             if cols is None or cols == "drop":
                 continue
             if isinstance(cols, (list, tuple, np.ndarray)):
-                expected_cols.update(cols)
+                expected_cols.extend(cols)
             else:
-                expected_cols.add(cols)
+                expected_cols.append(cols)
+
+        expected_cols = [str(c) for c in expected_cols]
         row = {c: "" for c in expected_cols}
         row["text_all"] = text
         X_df = pd.DataFrame([row])
-        return _proba1_from_matrix(model.predict_proba(X_df))
-    # last resort
+        X_df.columns = X_df.columns.astype(str)
+
+        try:
+            return _proba1_from_matrix(model.predict_proba(X_df))
+        except TypeError:
+            st.error(
+                "Couldn't run prediction with this uploaded model due to feature name/type mismatch.\n"
+                "Fixes:\n"
+                "• Retrain in-app on this environment (recommended), or\n"
+                "• Upload a text-only model (no categories/numerics), or\n"
+                "• Rebuild the model under scikit-learn 1.7.x and re-export."
+            )
+            return 0.5
+
+    # Last resort
     return _proba1_from_matrix(model.predict_proba([text]))
 
 # ----------------------------- Sidebar: Data loading -----------------------------
@@ -212,7 +275,7 @@ with tab_clf:
                 st.sidebar.success("Uploaded model bundle loaded.")
             else:
                 # Single pipeline: wrap with default threshold
-                bundle = {"model_strict": maybe_bundle, "thr_strict": 0.5}
+                bundle = {"model_strict": maybe_bundle, "thr_strict": 0.5, "sklearn_version": None}
                 st.sidebar.success("Uploaded single model, using default threshold 0.50.")
         except Exception as e:
             st.sidebar.error(f"Could not load uploaded bundle: {e}")
@@ -289,8 +352,21 @@ with tab_clf:
         elif "broad" in which and "model_broad" in bundle:
             model = bundle["model_broad"]
             threshold = float(bundle.get("thr_broad", 0.5))
+
         if model is not None:
+            # Warn if uploaded bundle has a mixed-selector ColumnTransformer
+            if hasattr(model, "named_steps") and "feats" in getattr(model, "named_steps", {}):
+                try:
+                    if has_mixed_selectors(model.named_steps["feats"]):
+                        st.warning(
+                            "Loaded model uses a ColumnTransformer with **mixed integer + string selectors**. "
+                            "sklearn ≥1.7 may fail at predict time. If predictions error out, retrain in-app "
+                            "or upload a text-only bundle."
+                        )
+                except Exception:
+                    pass
             st.success(f"Classifier ready (threshold={threshold:.2f})")
+
     # Allow manual threshold tweak for any loaded/trained model
     threshold = st.slider("Decision threshold (class 1 = urgent)", 0.05, 0.95, float(threshold), 0.01)
 
@@ -361,7 +437,7 @@ with tab_clf:
                         best_cm = cm
 
                 model = pipe
-                threshold = float(best_t)  # update slider default visually via help text
+                threshold = float(best_t)
                 roc = roc_auc_score(y_test, p)
 
                 st.success(f"Trained. Best threshold (macro F2): {threshold:.2f} | ROC-AUC: {roc:.3f}")
