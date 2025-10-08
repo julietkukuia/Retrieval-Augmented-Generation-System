@@ -1,5 +1,12 @@
-# app_rag_classifier.py — "fastest easy way out" edition
-import os, re, numpy as np, pandas as pd, streamlit as st
+# app_rag_classifier.py
+# Ticket RAG + Urgency Classifier (streamlit-safe, calibrated when available)
+
+import os
+import re
+import numpy as np
+import pandas as pd
+import streamlit as st
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity, linear_kernel
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
@@ -8,180 +15,265 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
-try:
-    # correct path on modern scikit-learn (e.g. 1.7.x)
-    from sklearn.calibration import CalibratedClassifierCV
-except Exception:
-    # very old versions fallback (won't be used on Streamlit Cloud)
-    from sklearn.calibrated import CalibratedClassifierCV
 from joblib import load as joblib_load, dump as joblib_dump
+
+# --- Calibration: prefer CalibratedClassifierCV if available; else fall back cleanly
+CALIB_AVAILABLE = True
+try:
+    from sklearn.calibration import CalibratedClassifierCV  # sklearn >= 0.18
+except Exception:
+    CalibratedClassifierCV = None
+    CALIB_AVAILABLE = False
 
 st.set_page_config(page_title="Ticket RAG + Urgency Classifier", layout="wide")
 
-# ---------- tiny helpers ----------
+# ----------------------------- Utilities -----------------------------
+
 def clean_text_keep_case(s: str) -> str:
+    """Notebook-aligned cleaner: keep case & apostrophes, trim, collapse spaces."""
     s = str(s).strip()
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[^A-Za-z0-9'\s]", " ", s)
     return s
 
 def expand_product_placeholders_series(desc: pd.Series, prod: pd.Series | None) -> pd.Series:
+    """Replace {product_purchased} (any casing/underscore/space) with Product Purchased."""
     if prod is None:
         return desc.fillna("").astype(str)
     rx = re.compile(r"\{product[_ ]purchased\}", flags=re.IGNORECASE)
-    return pd.Series([rx.sub(p or "", d or "") for d, p in zip(desc, prod)], index=desc.index)
+    out = []
+    for d, p in zip(desc.fillna("").astype(str), prod.fillna("").astype(str)):
+        out.append(rx.sub(p, d))
+    return pd.Series(out, index=desc.index)
 
 def build_text_clean(df: pd.DataFrame) -> pd.Series:
-    # honor precomputed clean column if present
+    """Use df['text_clean'] if present; else expand placeholders, then clean (keep case)."""
     if "text_clean" in df.columns:
         return df["text_clean"].astype(str).fillna("").apply(clean_text_keep_case)
+
     desc = df.get("Ticket Description", pd.Series([""] * len(df), index=df.index)).astype(str)
-    subj = df.get("Ticket Subject", pd.Series([""] * len(df), index=df.index)).astype(str)
     prod = df.get("Product Purchased", None)
-    return (subj.fillna("") + " " + expand_product_placeholders_series(desc, prod).fillna("")).apply(clean_text_keep_case)
+    desc_expanded = expand_product_placeholders_series(desc, prod)
+    subj = df.get("Ticket Subject", pd.Series([""] * len(df), index=df.index)).astype(str)
+    return (subj.fillna("") + " " + desc_expanded.fillna("")).apply(clean_text_keep_case)
 
 def extractive_summary(query: str, docs: list[str], max_sentences: int = 3) -> str:
+    """Simple extractive summary via TF-IDF sentence scoring with redundancy penalty."""
     text = " ".join([str(d) for d in docs])
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
     if not sentences:
         return "No summary available."
+
     vec = TfidfVectorizer(ngram_range=(1,2), stop_words="english", min_df=1)
     S = vec.fit_transform(sentences)
     q = vec.transform([query])
+
     base = linear_kernel(q, S).ravel()
-    chosen = []
+
+    chosen_idx = []
     for _ in range(min(max_sentences, len(sentences))):
         best_i, best_score = None, -1e9
         for i in range(len(sentences)):
-            if i in chosen: 
+            if i in chosen_idx:
                 continue
-            redundancy = 0.0 if not chosen else max(linear_kernel(S[i], S[chosen]).ravel())
+            redundancy = 0.0 if not chosen_idx else max(linear_kernel(S[i], S[chosen_idx]).ravel())
             score = base[i] - 0.4 * redundancy
             if score > best_score:
                 best_i, best_score = i, score
-        chosen.append(best_i)
-    return " ".join([sentences[i] for i in chosen])
+        chosen_idx.append(best_i)
+
+    return " ".join([sentences[i] for i in chosen_idx])
+
+# ---------- Robust prediction for text-only OR column-transformer pipelines ----------
+
+def _proba1_from_matrix(m: np.ndarray) -> float:
+    """Safe extraction of class-1 probability from a (1,2) predict_proba output."""
+    # predict_proba returns shape (n_samples, 2). We want [0, 1].
+    return float(m[0, 1])
 
 def predict_proba_safe(model, text: str) -> float:
-    # Text-only pipeline?
-    if hasattr(model, "named_steps") and "tfidf" in model.named_steps:
-        return float(model.predict_proba([text]).ravel()[1])
-    # ColumnTransformer pipeline?
+    """
+    Works with:
+      A) text-only pipeline: Pipeline([('tfidf', ...), ('clf', ...)])
+      B) column-transformer pipeline: Pipeline([('feats', ColumnTransformer), ('clf', ...)])
+         expecting a DataFrame that contains at least a 'text_all' column.
+    """
+    if hasattr(model, "predict_proba"):
+        # Some models may accept raw strings (text-only pipeline)
+        try:
+            return _proba1_from_matrix(model.predict_proba([text]))
+        except Exception:
+            pass  # fall through to ColumnTransformer handling
+
     if hasattr(model, "named_steps") and "feats" in model.named_steps:
         feats = model.named_steps["feats"]
+        # Collect expected input columns (labels passed to ColumnTransformer)
         expected_cols = set()
-        for _, _, cols in feats.transformers_:
+        for name, trans, cols in feats.transformers_:
             if cols is None or cols == "drop":
                 continue
             if isinstance(cols, (list, tuple, np.ndarray)):
                 expected_cols.update(cols)
             else:
                 expected_cols.add(cols)
+
+        # Build one-row DataFrame; fill everything with "" unless it's text_all
         row = {c: "" for c in expected_cols}
         row["text_all"] = text
-        return float(model.predict_proba(pd.DataFrame([row])).ravel()[1])
-    # Fallback
-    return float(model.predict_proba([text]).ravel()[1])
+        X_df = pd.DataFrame([row])
+        return _proba1_from_matrix(model.predict_proba(X_df))
 
-# ---------- data load ----------
+    # Last resort: assume it takes a list[str]
+    return _proba1_from_matrix(model.predict_proba([text]))
+
+# ----------------------------- Sidebar: Data loading -----------------------------
+
 st.sidebar.title("⚙️ Data")
 csv_path = st.sidebar.text_input("CSV path", value="ticket_rag_data.csv")
 uploaded = st.sidebar.file_uploader("…or upload CSV", type=["csv"])
+
 if uploaded is not None:
     df = pd.read_csv(uploaded)
-elif os.path.exists(csv_path):
-    df = pd.read_csv(csv_path)
 else:
-    st.error("CSV not found. Provide a valid path or upload a CSV.")
-    st.stop()
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+    else:
+        st.error("CSV not found. Provide a valid path or upload a CSV.")
+        st.stop()
+
 st.success(f"Loaded {len(df):,} tickets")
 
-# ---------- retriever ----------
+# ----------------------------- Build RAG corpus -----------------------------
+
 @st.cache_resource(show_spinner=False)
 def fit_retriever(corpus_df: pd.DataFrame):
     text_clean = build_text_clean(corpus_df)
-    tfidf = TfidfVectorizer(ngram_range=(1,2), stop_words="english", min_df=2, max_df=0.9, sublinear_tf=True)
+
+    tfidf = TfidfVectorizer(
+        ngram_range=(1, 2),
+        stop_words="english",
+        min_df=2,
+        max_df=0.9,
+        sublinear_tf=True,
+    )
     X = tfidf.fit_transform(text_clean)
     return tfidf, X
-tfidf, X = fit_retriever(df)
-st.caption(f"TF-IDF fitted (docs × terms = {X.shape[0]} × {X.shape[1]}).")
 
+tfidf, X = fit_retriever(df)
+st.caption(f"TF-IDF fitted on cleaned text (docs × terms = {X.shape[0]} × {X.shape[1]}).")
+
+# Use expanded descriptions for display & summary
 def retrieve(query: str, k: int = 5) -> pd.DataFrame:
-    sims = cosine_similarity(tfidf.transform([clean_text_keep_case(query)]), X).ravel()
-    idx = np.argsort(-sims)[:k]
-    hits = df.iloc[idx].copy()
+    q_vec = tfidf.transform([clean_text_keep_case(query)])
+    sims = cosine_similarity(q_vec, X).ravel()
+    top_idx = np.argsort(-sims)[:k]
+
+    hits = df.iloc[top_idx].copy()
     desc = hits.get("Ticket Description", pd.Series([""] * len(hits), index=hits.index)).astype(str)
     prod = hits.get("Product Purchased", None)
-    hits_out = hits[["Ticket ID","Ticket Type","Ticket Subject"]].copy()
-    hits_out["Ticket Description (expanded)"] = expand_product_placeholders_series(desc, prod).values
-    hits_out["similarity"] = sims[idx]
-    return hits_out
+    desc_expanded = expand_product_placeholders_series(desc, prod)
 
-# ---------- UI ----------
+    out = hits[["Ticket ID", "Ticket Type", "Ticket Subject"]].copy()
+    out["Ticket Description (expanded)"] = desc_expanded.values
+    out["similarity"] = sims[top_idx]
+    return out
+
+# ----------------------------- Tabs -----------------------------
+
 tab_rag, tab_clf = st.tabs(["🔎 RAG Search + Summary", "🧭 Urgency Classifier"])
 
 with tab_rag:
     st.header("Query tickets")
     q = st.text_input("Search query", value="refund not processed after cancellation")
-    k = st.slider("Top K", 1, 10, 6)
+    k = st.slider("Top K", 1, 10, 8)
     if st.button("Search", type="primary"):
         hits = retrieve(q, k=k)
+        # Streamlit deprecation fix: use width="stretch"
         st.dataframe(hits, width="stretch")
         summary = extractive_summary(q, hits["Ticket Description (expanded)"].tolist(), max_sentences=3)
         st.subheader("Summary (extractive):")
         st.info(summary)
 
+# ----------------------------- Classifier -----------------------------
+
 with tab_clf:
     st.header("Train / use urgency classifier")
 
-    # Optional: try to load a pre-trained bundle, but ignore incompatibilities
+    # Try to load a pre-trained bundle if present
     models_path = st.sidebar.text_input("Pretrained models (optional)", value="urgency_models.joblib")
-    bundle, model, threshold = None, None, 0.5
+    bundle = None
     if os.path.exists(models_path):
         try:
             bundle = joblib_load(models_path)
-            which = st.selectbox("Choose pre-trained model", ["strict (bundle)", "broad (bundle)"])
-            if "strict" in which and "model_strict" in bundle:
-                model = bundle["model_strict"]; threshold = float(bundle.get("thr_strict", 0.5))
-            elif "broad" in which and "model_broad" in bundle:
-                model = bundle["model_broad"];  threshold = float(bundle.get("thr_broad", 0.5))
             st.sidebar.success("Loaded urgency_models.joblib")
         except Exception as e:
-            st.sidebar.warning(f"Ignoring incompatible model file: {e}")
+            st.sidebar.warning(f"Could not load joblib: {e}")
 
+    # Let user upload a training CSV for classifier if they want to train in-app
     clf_file = st.sidebar.file_uploader("Upload training CSV for classifier (optional)", type=["csv"], key="clf")
+    clf_df = None
+    if clf_file is not None:
+        try:
+            clf_df = pd.read_csv(clf_file)
+        except Exception as e:
+            st.warning(f"Could not read training CSV: {e}")
 
+    # --- Helper: build labels from CSV
     def build_urgent_labels(frame: pd.DataFrame) -> pd.Series | None:
+        """Prefer an 'urgent' column (0/1). Else derive from Ticket Priority if present."""
         if "urgent" in frame.columns:
             return pd.to_numeric(frame["urgent"], errors="coerce").fillna(0).astype(int)
+
         if "Ticket Priority" in frame.columns:
             pr = frame["Ticket Priority"].astype(str).str.lower()
-            mapping = {"critical":1,"high":1,"urgent":1,"p1":1,"medium":0,"low":0}
-            return pr.map(mapping).fillna(0).astype(int)
+            priority_map = {"critical": 1, "high": 1, "p1": 1, "urgent": 1, "medium": 0, "low": 0}
+            return pr.map(priority_map).fillna(0).astype(int)
+
         return None
 
+    # --- Helper: text column for classifier
     def build_text_all(frame: pd.DataFrame) -> pd.Series:
         desc = frame.get("Ticket Description", pd.Series([""] * len(frame), index=frame.index)).astype(str)
         subj = frame.get("Ticket Subject", pd.Series([""] * len(frame), index=frame.index)).astype(str)
         prod = frame.get("Product Purchased", None)
-        return (subj.fillna("") + " " + expand_product_placeholders_series(desc, prod).fillna("")).apply(clean_text_keep_case)
+        desc_expanded = expand_product_placeholders_series(desc, prod)
+        return (subj.fillna("") + " " + desc_expanded.fillna("")).apply(clean_text_keep_case)
 
+    # --- Classifier builder (text only for robustness & speed)
     def make_clf_pipeline():
         tf = TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95, stop_words="english", sublinear_tf=True)
         base = LogisticRegression(C=1.0, class_weight="balanced", max_iter=1000, solver="liblinear")
-        clf = CalibratedClassifierCV(estimator=base, method="sigmoid", cv=5)
-        return Pipeline([("tfidf", tf), ("clf", clf)])
+        if CALIB_AVAILABLE:
+            clf = CalibratedClassifierCV(estimator=base, method="sigmoid", cv=5)
+            return Pipeline([("tfidf", tf), ("clf", clf)])
+        # Fallback: plain LR has calibrated probabilities already
+        return Pipeline([("tfidf", tf), ("clf", base)])
 
+    # ---- Choose model source
+    model = None
+    threshold = 0.5
+    validation_report = None
+    confusion = None
+    roc = None
+
+    if bundle is not None:
+        which = st.selectbox("Choose pre-trained model", ["strict (bundle)", "broad (bundle)"])
+        if "strict" in which and "model_strict" in bundle:
+            model = bundle["model_strict"]
+            threshold = float(bundle.get("thr_strict", 0.5))
+        elif "broad" in which and "model_broad" in bundle:
+            model = bundle["model_broad"]
+            threshold = float(bundle.get("thr_broad", 0.5))
+
+        if model is not None:
+            st.success(f"Classifier ready (threshold={threshold:.2f})")
+
+    # Train from uploaded CSV if requested
     if st.checkbox("Train a classifier from uploaded CSV"):
-        if clf_file is None:
+        if clf_df is None:
             st.warning("Upload a training CSV in the sidebar.")
         else:
-            try:
-                clf_df = pd.read_csv(clf_file)
-            except Exception as e:
-                st.error(f"Could not read training CSV: {e}")
-                st.stop()
-
             y = build_urgent_labels(clf_df)
             if y is None:
                 st.error("Training CSV must contain either an 'urgent' column or 'Ticket Priority'.")
@@ -193,32 +285,50 @@ with tab_clf:
                 pipe = make_clf_pipeline()
                 with st.spinner("Training..."):
                     pipe.fit(X_train, y_train)
-                p = pipe.predict_proba(X_test)[:,1]
-                def fbeta(prec, rec, beta): return (1+beta**2)*prec*rec / (beta**2*prec + rec + 1e-9)
-                best_f, best_t, best_rep, best_cm = -1, 0.5, None, None
+                p = pipe.predict_proba(X_test)  # (n, 2)
+                p1 = p[:, 1]
+
+                # Simple threshold selection by macro F2
+                def fbeta(prec, rec, beta):
+                    return (1+beta**2)*prec*rec / (beta**2*prec + rec + 1e-9)
+                best_f, best_t = -1, 0.5
+                best_rep, best_cm = None, None
                 for t in np.linspace(0.2, 0.8, 13):
-                    y_hat = (p >= t).astype(int)
-                    tn, fp, fn, tp = confusion_matrix(y_test, y_hat, labels=[0,1]).ravel()
-                    prec1 = tp/(tp+fp+1e-9); rec1 = tp/(tp+fn+1e-9)
-                    prec0 = tn/(tn+fn+1e-9); rec0 = tn/(tn+fp+1e-9)
+                    y_hat = (p1 >= t).astype(int)
+                    cm = confusion_matrix(y_test, y_hat, labels=[0,1])
+                    tn, fp, fn, tp = cm.ravel()
+                    prec1 = tp / (tp + fp + 1e-9); rec1 = tp / (tp + fn + 1e-9)
+                    prec0 = tn / (tn + fn + 1e-9); rec0 = tn / (tn + fp + 1e-9)
                     f1 = fbeta(prec1, rec1, 2.0); f0 = fbeta(prec0, rec0, 2.0)
-                    fmacro = 0.5*(f0+f1)
+                    fmacro = 0.5 * (f0 + f1)
                     if fmacro > best_f:
                         best_f, best_t = fmacro, t
                         best_rep = classification_report(y_test, y_hat, digits=3, zero_division=0)
-                        best_cm = np.array([[tn, fp],[fn, tp]])
-                model, threshold = pipe, float(best_t)
-                roc = roc_auc_score(y_test, p)
+                        best_cm = cm
+
+                model = pipe
+                threshold = float(best_t)
+                validation_report = best_rep
+                confusion = best_cm
+                roc = roc_auc_score(y_test, p1)
+
                 st.success(f"Classifier trained. Best threshold (macro F2): {threshold:.2f}; ROC-AUC {roc:.3f}")
                 with st.expander("Validation report"):
-                    st.text(best_rep); st.text(f"Confusion matrix:\n{best_cm}")
+                    st.text(validation_report)
+                    st.text(f"Confusion matrix:\n{confusion}")
+                if not CALIB_AVAILABLE:
+                    st.info("Note: CalibratedClassifierCV not available in this environment; using plain LogisticRegression probabilities.")
+
                 if st.button("Save classifier as urgency_models.joblib"):
                     joblib_dump({"model_strict": model, "thr_strict": threshold}, "urgency_models.joblib")
                     st.success("Saved urgency_models.joblib")
 
     st.subheader("Predict urgency for a new ticket")
     new_subj = st.text_input("Ticket Subject", value="Refund request")
-    new_desc = st.text_area("Ticket Description", value="I'm having trouble with my refund after cancelling my order.")
+    new_desc = st.text_area(
+        "Ticket Description",
+        value="I'm having trouble with my refund after cancelling my order."
+    )
     if st.button("Predict Urgency"):
         if model is None:
             st.warning("No classifier loaded or trained yet.")
@@ -229,4 +339,5 @@ with tab_clf:
             st.write(f"Urgent probability: **{prob:.3f}**  |  Threshold: **{threshold:.2f}**")
             st.success("Prediction: **URGENT**" if pred == 1 else "Prediction: **Non-urgent**")
 
-st.caption("Built with scikit-learn + Streamlit • Safe imports • Trains in-app if needed")
+# ----------------------------- Footer -----------------------------
+st.caption("Built with scikit-learn + Streamlit • Notebook-aligned cleaning • No external APIs")
